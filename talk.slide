@@ -1,0 +1,383 @@
+The Dynamic Duo of Go and PostgreSQL
+
+Jack Christensen
+http://www.jackchristensen.com
+
+* Introduction / Where This Talk Is Coming From
+
+- Thanks to Hashrocket for hosting ChicaGoLang
+- Ruby on Rails Active Record since pre-v1.0 (~10 years)
+- Author of multiple PostgreSQL ActiveRecord extension
+- Author of pgx database driver for Go
+
+* database/sql
+
+database/sql is the standard library Go interface for connecting to a relational database.
+
+- Query(): run query expecting 0 or more result rows
+- QueryRow(): run query expecting exactly 1 result row
+- Exec(): run query that does not return rows
+- Begin(): begin a transaction
+- Prepare(): prepare a statement
+
+* QueryRow Example
+
+  var firstName, lastName string
+  var middleName sql.NullString
+  err := db.QueryRow(
+    "SELECT first_name, middle_name, last_name FROM people WHERE id = $1", id,
+  ).Scan(&firstName, &middleName, &lastName)
+  if err != nil {
+      log.Fatal(err)
+  }
+
+- NULL is annoying
+
+* database/sql Abstraction Level
+
+- Supports multiple databases
+- Does not expose database specific functionality
+- Abstracts away / hides connection pool
+- No automatic structure binding or ORM features
+
+database/sql is the lowest level interface common to relational databases.
+
+* PostgreSQL Is Not Least Common Denominator
+
+- LISTEN / NOTIFY
+- Advisory locks
+- FOR UPDATE / SKIP LOCKED
+- Generated JSON
+- Advanced types
+- Unlogged tables and async commit
+
+* LISTEN / NOTIFY
+
+- Simple notification system with text only payload
+- Notifications can be created manually or in a trigger
+- Transactional -- this is a big deal
+- Scaling may be an issue at over 1,000 per second
+
+* LISTEN / NOTIFY Example Using pgx
+
+Listen:
+
+  conn.Listen("chat")
+
+  for {
+    notification, err := conn.WaitForNotification(time.Second)
+    if err == pgx.ErrNotificationTimeout {
+      continue
+    }
+    if err != nil {
+      // Handle error
+    }
+
+    // Do something with notification
+  }
+
+Notify:
+
+  _, err = pool.Exec("select pg_notify('chat', $1)", msg)
+  if err != nil {
+    // Handle error
+  }
+
+* Advisory Locks
+
+- Simple, fast locks enforced by database
+- Lock identifiers are numbers -- collisions possible, but safe
+- More info: https://hashrocket.com/blog/posts/advisory-locks-in-postgres
+
+Acquire a lock (blocking)
+
+  select pg_advisory_lock(1);
+
+Release a lock
+
+  select pg_advisory_unlock(1);
+
+Try to acquire a lock -- returns true if successful
+
+  select pg_try_advisory_lock(1);
+
+* FOR UPDATE / SKIP LOCKED
+
+- New in PostgreSQL 9.5
+- Perfect for jobs queues
+- Locked rows are skipped
+- Purposely breaks transaction isolation
+
+  // omitting error handling for brevity
+  tx, _ := db.Begin
+  tx.QueryRow(
+    "select id, payload from jobs limit 1 for update skip locked",
+  ).Scan(&id, &payload)
+
+  // Do stuff with payload
+  tx.Exec("delete from jobs where id=$1", id)
+
+  tx.Commit()
+
+* Generated JSON
+
+- PostgreSQL can generate JSON from relational data
+- Go can act as a simple relay to pass JSON on to client
+- Very performant and minimal Go logic required
+
+  select coalesce(json_agg(row_to_json(t)), '[]'::json)
+  from (
+    select
+      items.id,
+      feeds.id as feed_id,
+      feeds.name as feed_name,
+      items.title,
+      items.url,
+      extract(epoch from coalesce(publication_time, items.creation_time)::timestamptz(0)) as publication_time
+    from feeds
+      join items on feeds.id=items.feed_id
+      join unread_items on items.id=unread_items.item_id
+    where user_id=$1
+    order by publication_time asc
+  ) t
+
+* Advanced Types
+
+- array
+- hstore
+- JSON and JSONB
+- inet and cidr
+- range
+
+database/sql does not natively support any of these types. Support can be added via custom encoders. pgx has native support for all except range (because there is no Go type to map to).
+
+* Serializable Transaction Isolation Level
+
+- Guarantees concurrent transactions could have executed in serial, or transaction will not commit
+- Prevents certain types of concurrency anomalies
+- SET TRANSACTION SERIALIZABLE as first query of transaction
+- Save round trip with BeginIso() if using pgx
+
+* Unlogged Tables and Async Commit
+
+  create unlogged table widgets(...);
+
+- Writes to unlogged tables are not written to the WAL
+- This improved write speed
+- In case of server crash all data in unlogged tables is lost
+- Session table?
+
+  SET LOCAL synchronous_commit TO OFF;
+
+- Async commit guarantees atomicity
+- Async commit does not guarantee durability
+- Async commit improves write speed
+
+* pgx
+
+- Full TLS connection control
+- Custom net.Dial function (SSH tunnel is simple)
+- Binary format support for custom types
+- After connect hook for arbitrary connection setup
+- Logging support
+- database/sql compatibility mode
+- Generally performs better than lib/pq by ~15% or more
+
+* System Architecture Suggestions
+
+As soon as there are multiple data stores, ACID is nearly impossible. Every additional moving part is another potential point of failure. Modern PostgreSQL is not just a powerful relational database it can also handle a substantial portion of what might otherwise be delegated to NoSQL.
+
+- Try PostgreSQL before adding a dedicated message queue
+- Try PostgreSQL before adding another data store
+- Job queues can be backed on PostgreSQL
+- JSON document storage
+
+Consider using background goroutines instead of separate worker processes.
+
+- Still need to write job to durable storage to avoid possibility of losing job
+- Go goroutines and channels go a long way if you can run on a single node
+
+* Go Application Structuring
+
+- Connection settings
+- ORM (or not)
+- Where does the SQL belong
+- Data Structures
+- Data Access Interface
+- Data Access Functions
+- Migrations
+
+* Connection Configuration
+
+Standard PostgreSQL environment variables can be read by lib/pq and jackc/pgx.
+
+- PGHOST
+- PGPORT
+- PGDATABASE
+- PGUSER
+- PGPASSWORD
+- PGSSLMODE
+- PGAPPNAME
+
+github.com/vaughan0/go-ini is a good choice for config files.
+
+* ORM (or not)
+
+- github.com/jmoiron/sqlx: extensions to database/sql
+- github.com/jinzhu/gorm: Full-ORM on top of database/sql
+- ORMs tend to make the easy things easier, and the hard things harder
+- Most ORMs are rely on reflection and field tags
+- SQL is not that hard
+- Manually mapping Scan arguments is boring, but easy
+
+* Where does the SQL belong?
+
+- For small applications, inline is okay
+- Consider breaking SQL out into separate SQL files
+- SQL files can be read at runtime, or compiled-in at build time
+- If performance is a concern, use prepared statements
+- Prepared statements can be initialized at program start
+- pgx will no-op duplicate prepared statements so they can also be lazily prepared
+
+  db.Prepare(`get_person`,  `select * from people where id=$1`)
+  db.Query(`get_person`, 1)
+
+* Data Structures
+
+- Strongly consider separating the data structures from domain structures
+- NULL is icky: NullString, NullInt64, etc.
+- NullX doesn't cover all cases
+- Unset / no change for INSERT and UPDATE
+- Unselected columns for SELECT
+- Need 3 states: Undefined, Null, and Present
+- Functions for INSERT and UPDATE should appropriately handle Undefined and Null
+- This avoids needing separate functions to handle each type of INSERT or UPDATE
+
+Performance tip: Don't use hex strings for binary data, use bytea
+
+* Data Structure Example
+
+  const (
+    Undefined Status = iota // Note: Undefined is zero/default value
+    Null
+    Present
+  )
+
+  type Int32 struct {
+    Value  int32
+    Status Status
+  }
+
+  // Other type definitions
+
+  type User struct {
+    ID             Int32
+    Name           String
+    PasswordDigest Bytes
+    PasswordSalt   Bytes
+    Email          String
+  }
+
+* Data Access Interface
+
+- Wrap all access to database through repository interface
+- Encapsulates transaction control
+- Allows replacement of implementation
+- Defines exact operations used instead of infinite query interface ORMs often provide
+- Can make data access stubbable in tests
+- Can makes testing over database more difficult because tests may access database in different ways than application
+
+* Data Access Interface Example
+
+  type repository interface {
+    CreateUser(user *User) (userID int32, err error)
+    GetUser(userID int32) (*User, error)
+    GetUserByName(name string) (*User, error)
+    GetUserByEmail(email string) (*User, error)
+    UpdateUser(userID int32, attributes *User) error
+
+    GetFeedsUncheckedSince(since time.Time) (feeds []Feed, err error)
+    CopyUnreadItemsAsJSONByUserID(w io.Writer, userID int32) error
+    MarkItemRead(userID, itemID int32) error
+  }
+
+* Data Access Functions
+
+- Data access functions take a DB / queryer interface (Conn, ConnPool, Tx)
+- Transaction control exists outside of data access functions
+- Typically all functions wrapped in a single data package
+- Defines exact operations used instead of infinite query interface ORMs often provide
+- Stubbing data access is difficult
+- Tests can easily directly access database
+- So can the application (for better or worse)
+
+* Data Access Functions Example
+
+  package data
+
+  type Queryer interface {
+    Query(sql string, args ...interface{}) (*pgx.Rows, error)
+    QueryRow(sql string, args ...interface{}) *pgx.Row
+    Exec(sql string, arguments ...interface{}) (pgx.CommandTag, error)
+  }
+
+  func InsertUser(db Queryer, row *User) error { ... }
+  func SelectUserByPK(db Queryer, id int32) (*User, error) { ... }
+  func SelectUserByName(db Queryer, name string) (*User, error) { ... }
+  func SelectUserByEmail(db Queryer, email string) (*User, error) { ... }
+
+  func GetFeedsUncheckedSince(db Queryer, since time.Time) ([]Feed, error) { ... }
+
+* Migrations
+
+Migrations should be handled separately from application.
+
+- Simpler when multiple applications access same database
+- Application should not own database objects
+- Grant permissions to application database user
+
+.link https://github.com/jackc/tern
+.link https://bitbucket.org/liamstask/goose/
+
+* Tern
+
+- PostgreSQL only
+- text/template support with sub-templates and merge variables
+- SSH tunnel support built-in
+
+  create table users(
+    id serial primary key,
+    name varchar(30) not null check(name ~ '\A[a-zA-Z0-9]+\Z'),
+    password_digest bytea not null,
+    password_salt bytea not null
+  );
+
+  create unique index users_name_unq on users (lower(name));
+
+  grant select, insert, update, delete on users to {{.app_user}};
+
+  ---- create above / drop below ----
+
+  drop table users;
+
+* pgxdata
+
+- Code generatation for table row structures and CRUD functions
+- Data types with Undefined value support
+- No reflection
+- Generates optimized CRUD for each table
+- Design goal is to do the minimum possible
+- Avoid the complication caused by trying to handle all cases
+- Hand-write anything complicated
+
+This is first public announcement of project.
+
+- Still very new
+- In use in a few projects
+
+.link https://github.com/jackc/pgxdata
+
+* Demo & Example Code
+
+* Questions?
+

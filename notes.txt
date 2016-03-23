@@ -1,0 +1,4 @@
+Time permitting:
+
+Demo pgx/postgresql chat
+Demo pgxdata creating data access structs and functions
