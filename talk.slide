@@ -3,9 +3,14 @@ The Dynamic Duo of Go and PostgreSQL
 Jack Christensen
 http://www.jackchristensen.com
 
-* Introduction / Where This Talk Is Coming From
+* Introduction
 
 - Thanks to Hashrocket for hosting ChicaGoLang
+- WiFi SSID and password is on white board
+- Pizza and drinks in back
+
+* Where This Talk Is Coming From
+
 - Ruby on Rails Active Record since pre-v1.0 (~10 years)
 - Author of multiple PostgreSQL ActiveRecord extension
 - Author of pgx database driver for Go
